@@ -1,0 +1,468 @@
+# Script assumes that all servers already has static ip-address, not in domain, there is no firewall restrictions and local administrators credentials are the same across servers.
+# CONFIG parameter also assume that you've already promoted all controllers and they are available for domain login
+# Additional DC promoted as non-global catalog accroding to initial exercise
+
+
+#Parameters section
+param ($Action)
+
+#Set script path
+$global:ScriptPath = split-path -parent $MyInvocation.MyCommand.Definition
+
+
+#Set winrm Trusted Host for pssession connections to remote hosts
+Set-Item WSMan:\localhost\Client\TrustedHosts * -Force
+
+
+######################################################
+                #FUNCTIONS DECLARE START#
+######################################################
+
+###COPY LOG FILES###
+#due the powershell second hop problem we can't just write errors to shared folder, so I decided to copy error file to local host using PSSession
+Function Copy-LogFiles {
+Write-Host "Please check the error file on $global:ScriptPath\Errors.txt" -ForegroundColor Red
+$errorMessage = $_.Exception.Message
+        $errorTimestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $errorText = "$errorTimestamp : $errorMessage"
+        Set-Content -Path "$env:USERPROFILE/Documents/Errors.txt" -Value $errorText;
+        $remoteFilePath = "$env:USERPROFILE/Documents/Errors.txt"
+        $localFilePath = "$global:ScriptPath/Errors.txt"
+        Copy-Item -Path $remoteFilePath -Destination $localFilePath
+    }
+
+###FIRST DC INSTALL###
+function Create-FirstDCInForest {
+    # Prompt user for remote machine IP address and checking if IP is in valid format from OS pov
+    do {
+    $global:FirstDC = Read-Host "Enter IP address of remote machine where first DC will be installed"
+            try {
+                    [System.Net.IPAddress]::Parse($global:FirstDC) | Out-Null
+                    $isValid = $true
+                }
+        catch {
+                Write-Host "$global:FirstDC is not a valid IP address. Please try again." -ForegroundColor Red
+                $isValid = $false
+              }
+        } until ($isValid)
+   
+   
+    # Create Forest and FirstDC
+Try {
+   $PSSession = New-PSSession -ComputerName $global:FirstDC
+   Enter-PSSession $PSSession
+   
+    # Prompt user for domain information
+    $domainName = Read-Host "Enter fully qualified domain name (e.g. contoso.com)"
+    $netBiosName = Read-Host "Enter NetBIOS domain name (e.g. CONTOSO)"
+    $DSRMPassword = Read-Host -AsSecureString "Enter DSRM admin password" 
+
+
+     if ((Get-WindowsFeature -Name ad-domain-services).Installed) {
+        Write-Host "AD DS was already installed on this machine" -ForegroundColor Green
+    }
+
+    else {
+        Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools
+        Install-ADDSForest `
+            -DomainName $using:domainName `
+            -DomainNetbiosName $using:netBiosName `
+            -ForestMode WinThreshold `
+            -DomainMode WinThreshold `
+            -InstallDns:$true `
+            -SafeModeAdministratorPassword $using:DSRMPassword `
+            -Force:$true     
+           }
+Exit-PSSession 
+
+      }
+      Catch {
+        Copy-LogFiles
+        
+            }
+    }
+
+###WAITING FOR SERVER REBOOT###
+
+#We need to wait till server starts after reboot
+function Wait-ServerReadyForWinRM {
+    param (
+        [int]$DelayInSeconds = 10,
+        [int]$MaxAttempts = 30
+    )
+    
+    #Check IP valid
+    do {
+    $ServerIP = Read-Host "Enter IP address of remote machine to test WinRM connection"
+            try {
+                [System.Net.IPAddress]::Parse($ServerIP) | Out-Null
+                $isValid = $true
+                }
+        catch {
+              Write-Host "$ServerIP is not a valid IP address. Please try again." -ForegroundColor Red
+              $isValid = $false
+              }
+        } until ($isValid)
+#Create loop and do winrm pings
+ Write-Host "Waiting for server $ServerName to be ready for WinRM connection..." -ForegroundColor Green
+    for ($i = 1; $i -le $MaxAttempts; $i++) {
+        if (Test-WSMan -ComputerName $ServerIP -ErrorAction SilentlyContinue) {
+            Write-Host "Server $ServerIP is ready for WinRM connection." -ForegroundColor Green
+            break
+        }
+        else {
+            Write-Host "Attempt $i : Server $ServerIP is not ready for WinRM connection yet. Retrying in $DelayInSeconds seconds..." -ForegroundColor Red
+            Start-Sleep -Seconds $DelayInSeconds
+        }
+    }
+}
+
+###CHECK FIRST DC AFTER PROMOTION###
+#We don't need to check replication, cause it's our first domain controller and it may be a lot of false positive messages
+function Check-FirstDCPromotion {
+     
+  Try {
+  $PSSession = New-PSSession -ComputerName $global:FirstDC
+   Enter-PSSession $PSSession 
+     
+    $errors = $null
+    Write-Host "Checking first DC for AD DS, DNS and dcdiag logs errors" -ForegroundColor Yellow
+    # Check if AD DS feature is installed
+    if (!(Get-WindowsFeature -Name ad-domain-services).Installed) {
+        $errors = "AD DS feature is not installed"
+    }
+
+    # Check vital event logs for errors
+    $eventLogs = @(
+        "Directory Service",
+        "DNS Server",
+        "Setup"
+    )
+    foreach ($log in $eventLogs) {
+        $errorsInLog = Get-WinEvent -LogName $log -ErrorAction SilentlyContinue | Where-Object {$_.Level -eq 2}
+        if ($errorsInLog) {
+            $errors += "`nErrors in $log log:"
+            $errors += $errorsInLog | ForEach-Object { "`n$($_.Message)" }
+        }
+    }
+
+    # Check dcdiag for errors
+    $dcdiagOutput = dcdiag /e
+    if ($dcdiagOutput -match "failed") {
+        $errors += "`nErrors in dcdiag:"
+        $errors += $dcdiagOutput | ForEach-Object { "`n$_" }
+        Write-Host "Please, check appropraite logs on $global:FirstDC, there is a small chance that DC promotion was finished incorrectly"
+       
+    }
+
+
+    # Write errors if exists
+    if ($errors) {
+        Write-Host $errors -ForegroundColor Red
+    }
+
+    # if no errors were found
+    If (!$errors) { Write-Host "There is no error in vital logs after first DC promotion" -ForegroundColor Green; 
+    
+     }
+        
+ Exit-PSSession      
+}
+    Catch {
+           Copy-LogFiles
+            }
+
+ 
+}
+
+###ADDITIONAL DC INSTALL###
+function Create-AdditionalDomainController {
+    
+    # Prompt user for remote machine IP address and checking if IP is in valid format from OS pov
+    do {
+    $AdditionalDC = Read-Host "Enter IP address of remote machine where additional DC will be installed"
+            try {
+                    [System.Net.IPAddress]::Parse($AdditionalDC) | Out-Null
+                    $isValid = $true
+                }
+        catch {
+                Write-Host "$AdditionalDC is not a valid IP address. Please try again." -ForegroundColor Red
+                $isValid = $false
+              }
+        } until ($isValid)
+   
+    Try {
+   
+   Invoke-Command -ComputerName $AdditionalDC -ScriptBlock {
+
+   $domainAdmin = "test\Administrator"
+   $password = ConvertTo-SecureString "!QAZ2wsx" -AsPlainText -Force
+   $credential = New-Object System.Management.Automation.PSCredential ($domainAdmin, $password)
+     
+    # Set the DNS server on the ethernet network interface to First DC
+    $netAdapter = Get-NetAdapter | Where-Object { $_.Name -like "Ethernet*" }
+    $netAdapter | Set-DnsClientServerAddress -ServerAddresses 10.50.16.10 # Change this IP according to your env
+
+    # Configure the server as a domain controller
+     
+    $domainName = Read-Host "Enter fully qualified domain name (e.g. contoso.com)"
+    $DSRMPassword = Read-Host -AsSecureString "Enter DSRM admin password"
+
+
+    Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools
+    Install-ADDSDomainController `
+        -InstallDns:$true `
+        -Credential $credential `
+        -DomainName $domainName `
+        -SafeModeAdministratorPassword $using:DSRMPassword `
+        -NoGlobalCatalog:$true `
+        -MoveInfrastructureOperationMasterRoleIfNecessary:$true `
+        -Force:$true 
+        }  
+
+}
+    Catch {
+        $errorMessage = $_.Exception.Message
+        $errorTimestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $errorText = "$errorTimestamp : $errorMessage"
+        Write-host $errorText
+            }
+
+}
+
+###CHECK ADDITIONALS DCs AFTER PROMOTION###
+function Check-AdditionalDCPromotion {
+# Prompt user for remote machine IP address and checking if IP is in valid format from OS pov
+    do {
+    $AdditionalDC = Read-Host "Enter IP address of remote machine you want to check DC promotion result"
+            try {
+                    [System.Net.IPAddress]::Parse($AdditionalDC) | Out-Null
+                    $isValid = $true
+                }
+        catch {
+                Write-Host "$AdditionalDC is not a valid IP address. Please try again." -ForegroundColor Red
+                $isValid = $false
+              }
+        } until ($isValid)
+
+    
+  Try {
+   #var creds
+   $domainAdmin = "test\Administrator"
+   $password = ConvertTo-SecureString "!QAZ2wsx" -AsPlainText -Force
+   $credential = New-Object System.Management.Automation.PSCredential ($domainAdmin, $password)
+
+   #connect to DC
+   $PSSession = New-PSSession -ComputerName $AdditionalDC -Credential $credential
+   Enter-PSSession $PSSession 
+     
+    $errors = $null
+    Write-Host "Checking first DC for AD DS, DNS and dcdiag logs errors" -ForegroundColor Yellow
+    # Check if AD DS feature is installed
+    if (!(Get-WindowsFeature -Name ad-domain-services).Installed) {
+        $errors = "AD DS feature is not installed"
+    }
+
+    # Check vital event logs for errors
+    $eventLogs = @(
+        "Directory Service",
+        "DNS Server",
+        "Setup"
+    )
+    foreach ($log in $eventLogs) {
+        $errorsInLog = Get-WinEvent -LogName $log -ErrorAction SilentlyContinue | Where-Object {$_.Level -eq 2}
+        if ($errorsInLog) {
+            $errors += "`nErrors in $log log:"
+            $errors += $errorsInLog | ForEach-Object { "`n$($_.Message)" }
+        }
+    }
+
+    # Check dcdiag for errors
+    $dcdiagOutput = dcdiag /e
+    if ($dcdiagOutput -contains "failed") {
+        $errors += "`nErrors in dcdiag:"
+        $errors += $dcdiagOutput | ForEach-Object { "`n$_" }
+        Write-Host "Please, check appropraite logs on $AdditionalDC, there is a small chance that DC promotion was finished incorrectly"
+       
+    }
+
+    
+    # Check repadmin for errors
+    $repadminOutput = repadmin /showrepl /errorsonly 
+    if ($repadminOutput -contains "failed") {
+        $errors += "`nErrors in repadmin:"
+        $errors += $repadminOutput | ForEach-Object { "`n$_" }
+    }
+
+    # Write errors if exists
+    if ($errors) {
+        Write-Host $errors -ForegroundColor Red
+    }
+
+    # if no errors were found
+    If (!$errors) { Write-Host "There is no error in vital logs after DC promotion" -ForegroundColor Green; 
+        
+     }
+
+  Exit-PSSession     
+       
+}
+    Catch {
+           Copy-LogFiles
+            }
+
+}
+
+###DCs SETUP###
+Function Configure-DomainControllers {
+
+   #var creds
+   $domainAdmin = "test\Administrator"
+   $password = ConvertTo-SecureString "!QAZ2wsx" -AsPlainText -Force
+   $credential = New-Object System.Management.Automation.PSCredential ($domainAdmin, $password)
+
+  #Set forwarders
+  Invoke-Command -ComputerName $Global:FirstDC -Credential $credential -ScriptBlock {
+Try {
+
+   
+   $registryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\DNS\Parameters"
+   $dnsServers = "8.8.8.8", "1.1.1.1" 
+   Set-ItemProperty -Path $registryPath -Name "Forwarders" -Value $dnsServers
+   }
+    
+Catch {
+$errorMessage = $_.Exception.Message
+        $errorTimestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $errorText = "$errorTimestamp : $errorMessage"
+        Write-host $errorText}
+
+}
+#Install and configure SSH on FirstDC
+Try {
+    #Connect to server
+    $a = New-PSSession -ComputerName $Global:FirstDC 
+    Enter-PSSession $a
+
+    #Install SSH and configure service
+    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+    Start-Service sshd
+    Set-Service -Name sshd -StartupType 'Automatic'
+    Set-Service -Name ssh-agent -StartupType 'Automatic' 
+    
+    # Enable password authentication and key based authentication
+    Set-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name PasswordAuthentication -Value 1
+    Set-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name PubkeyAuthentication -Value 1
+    Set-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name LogLevel -Value 'VERBOSE'
+       
+    Exit-PSSession
+    }
+
+Catch {
+Copy-LogFiles
+}
+
+#Generate ssh key pair, add it to ssh agent and copy public key to ssh folder
+Invoke-Command -ComputerName $Global:FirstDC -Credential $credential -ScriptBlock {
+ssh-keygen -t ed25519 -f $env:USERPROFILE\Documents\ID_key -N '""'; 
+Set-Service -Name ssh-agent -StartupType 'Automatic'; 
+Start-Service ssh-agent; 
+ssh-add $env:USERPROFILE\documents\ID_key; 
+Copy-Item $env:USERPROFILE\documents\ID_key.pub -Destination C:\ProgramData\ssh\ }
+
+#Copy key pair to source host and to another DC 
+Enter-PSSession $a
+Copy-Item -FromSession $a -Path $env:USERPROFILE\documents\ID_key.pub -Destination C:\Scripts
+Copy-Item -FromSession $a -Path $env:USERPROFILE\documents\ID_key -Destination C:\Scripts
+Exit-PSSession
+
+$b = New-PSSession -ComputerName 10.50.16.11 -Credential $credential
+Enter-PSSession $b
+ #Install SSH and configure service
+    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+    Start-Service sshd
+    Set-Service -Name sshd -StartupType 'Automatic'
+    Set-Service -Name ssh-agent -StartupType 'Automatic' 
+    
+    # Disable password authentication and enable key based authentication
+    Set-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name PasswordAuthentication -Value 0
+    Set-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name PubkeyAuthentication -Value 1
+    Set-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name LogLevel -Value 'VERBOSE'
+
+    #Copy files to DC
+    Copy-Item -ToSession $b -Path C:\Scripts\ID_key  -Destination $env:USERPROFILE\documents\ID_key
+    Copy-Item -ToSession $b -Path C:\Scripts\ID_key.pub  -Destination $env:USERPROFILE\documents\ID_key.pub
+
+    Exit-PSSession
+
+    #Add key pair to ssh agent and copy public key to ssh folder
+    Invoke-Command -ComputerName 10.50.16.11 -Credential $credential -ScriptBlock {
+    Set-Service -Name ssh-agent -StartupType 'Automatic'; 
+    Start-Service ssh-agent; 
+
+    #Change permissions on key_file
+    icacls C:\Users\Administrator\documents\ID_key /inheritance:r
+    start-process "icacls.exe" -ArgumentList 'C:\Users\Administrator\documents\ID_key /grant:r "$env:USERNAME":"(R)"'
+
+    ssh-add C:\Users\Administrator\documents\ID_key; 
+    Copy-Item C:\Users\Administrator\documents\ID_key.pub -Destination C:\ProgramData\ssh\ }
+    #Sorry, I'm tired to put try\catch to this last part :)
+}
+
+###JOIN HOST TO DOMAIN###
+Function Join-HostToDomain {
+
+    #DA var
+    $domainAdmin = "test\Administrator"
+    $password = ConvertTo-SecureString "!QAZ2wsx" -AsPlainText -Force
+    $credential = New-Object System.Management.Automation.PSCredential ($domainAdmin, $password)
+
+    If (Get-WmiObject -Class Win32_ComputerSystem | Select-Object -ExpandProperty Domain) {
+    # Set the DNS server on the ethernet network interface to First DC
+    $netAdapter = Get-NetAdapter | Where-Object { $_.Name -like "Ethernet*" }
+    $netAdapter | Set-DnsClientServerAddress -ServerAddresses 10.50.16.10
+
+    #Rename our host without reboot
+    $ComputerName = "MemberServer"
+   
+    Remove-ItemProperty -path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -name "Hostname" 
+    Remove-ItemProperty -path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -name "NV Hostname" 
+
+    Set-ItemProperty -path "HKLM:\SYSTEM\CurrentControlSet\Control\Computername\Computername" -name "Computername" -value $ComputerName
+    Set-ItemProperty -path "HKLM:\SYSTEM\CurrentControlSet\Control\Computername\ActiveComputername" -name "Computername" -value $ComputerName
+    Set-ItemProperty -path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -name "Hostname" -value $ComputerName
+    Set-ItemProperty -path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -name "NV Hostname" -value  $ComputerName
+    Set-ItemProperty -path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -name "AltDefaultDomainName" -value $ComputerName
+    Set-ItemProperty -path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -name "DefaultDomainName" -value $ComputerName
+
+
+    #User the dirtyhack to switch to old domain join behavior, restart machine :) I know about https://support.microsoft.com/en-us/topic/kb5020276-netjoin-domain-join-hardening-changes-2b65a0f3-1f4c-42ef-ac0f-1caaf421baf8
+    New-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\ -Name NetJoinLegacyAccountReuse -PropertyType DWORD -Value 1
+
+    Add-Computer -Credential $credential -DomainName test.local
+
+    Remove-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\ -Name NetJoinLegacyAccountReuse
+
+    }
+    
+    }
+
+######################################################
+                #FUNCTIONS DECLARE END#
+######################################################
+
+
+
+#|Build script parameters
+
+If (($Action) -and ($Action.ToUpper() -like "/Forest")) {Create-FirstDCInForest; Wait-ServerReadyForWinRM; Check-FirstDCPromotion}
+elseif (($Action) -and ($Action.ToUpper() -like "/Promote")) {Create-AdditionalDomainController; Wait-ServerReadyForWinRM; Check-AdditionalDCPromotion}
+elseif (($Action) -and ($Action.ToUpper() -like "/All")) {Create-FirstDCInForest; Wait-ServerReadyForWinRM; Check-FirstDCPromotion; Create-AdditionalDomainController; Wait-ServerReadyForWinRM; Check-AdditionalDCPromotion; Join-HostToDomain}
+elseif (($Action) -and ($Action.ToUpper() -like "/Config")) {Configure-DomainControllers}
+elseif (($Action) -and ($Action.ToUpper() -like "/Join")) {Join-HostToDomain}
+else {Write-Host "/Forest - create first DC in the forest and check errors" -ForegroundColor Cyan
+      Write-Host "/Promote - promote additional DC in existing forest and check errors"-ForegroundColor Cyan
+      Write-Host "/All - promote first DC in the forest, then promote additional DC and check errors" -ForegroundColor Cyan 
+      Write-Host "/Config - Configure SSH authN on DC's and DNS forwarders" -ForegroundColor Cyan 
+      Write-Host "/Join - Join script execution host to domain" -ForegroundColor Cyan
+     }
