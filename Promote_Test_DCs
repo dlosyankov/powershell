@@ -1,5 +1,5 @@
 # Script assumes that all servers already has static ip-address, not in domain, there is no firewall restrictions and local administrators credentials are the same across servers.
-# CONFIG parameter also assume that you've already promoted all controllers and they are available for domain login
+# CONFIG parameter also assumes that you've already promoted all controllers and they are available for domain login
 # Additional DC promoted as non-global catalog accroding to initial exercise
 
 
