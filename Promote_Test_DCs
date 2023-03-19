@@ -468,3 +468,4 @@ else {Write-Host "/Forest - create first DC in the forest and check errors" -For
       Write-Host "/Config - Configure SSH authN on DC's and DNS forwarders" -ForegroundColor Cyan 
       Write-Host "/Join - Join script execution host to domain" -ForegroundColor Cyan
      }
+```
