@@ -1,4 +1,3 @@
-```powershell
 
 # Script assumes that all servers already has static ip-address, not in domain, there is no firewall restrictions and local administrators credentials are the same across servers.
 # CONFIG parameter also assumes that you've already promoted all controllers and they are available for domain login
@@ -468,4 +467,4 @@ else {Write-Host "/Forest - create first DC in the forest and check errors" -For
       Write-Host "/Config - Configure SSH authN on DC's and DNS forwarders" -ForegroundColor Cyan 
       Write-Host "/Join - Join script execution host to domain" -ForegroundColor Cyan
      }
-```
+
